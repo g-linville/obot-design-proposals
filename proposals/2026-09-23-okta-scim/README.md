@@ -14,7 +14,7 @@ existing users, identities, groups, and group memberships.
 
 ## Related issues
 
-- No GitHub issue yet
+- https://github.com/obot-platform/field-issues/issues/38
 
 ## Related ODPs
 
