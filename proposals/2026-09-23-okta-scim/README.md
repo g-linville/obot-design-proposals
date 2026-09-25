@@ -110,7 +110,7 @@ flowchart LR
         Auth["Sign-in and credentials"] --> Check["Admission check"]
         Endpoint["SCIM endpoint"]
         DB[("Gateway database: users, identities, groups, memberships, SCIM bindings, lifecycle outbox")]
-        Ctrl["Controllers: revoke refresh tokens, reconcile roles and group access"]
+        Ctrl["Controller store: refresh token revocation; controllers reconcile roles and group access"]
     end
     OIDC -- "sign-in" --> Auth
     App -- "SCIM 2.0 with bearer token" --> Endpoint
@@ -241,9 +241,9 @@ No new credential is issued for a disabled user. API key creation refuses them, 
 
 **Disabling a user.** One transaction sets the lifecycle columns, deletes the user's gateway auth tokens, which ends their browser sessions, and writes an outbox event. After it commits:
 
-- The event is delivered to the controller store as a `UserLifecycleChange` named after the event, so delivering it again changes nothing.
-- The leader deletes the user's MCP OAuth refresh tokens. MCP deployments, including shared ones, keep running.
-- Handlers act on the user's current state, so a late event for a user who was already reactivated does nothing. They never delete data, memberships, or resources.
+- Outbox delivery deletes the user's MCP OAuth refresh tokens from the controller store, then marks the event delivered. A failed delivery is retried. No controller object is created for the event.
+- Delivery acts on the user's current state, so a late event for a user who was already reactivated deletes nothing. Delivering an event more than once also changes nothing, because a disabled user cannot obtain new refresh tokens.
+- Delivery never deletes data, memberships, or resources. MCP deployments, including shared ones, keep running.
 
 Requests already in flight, such as streaming responses, are not closed, and neither are the user's MCP client sessions. Both are held in the memory of the replica serving them, so closing them would need a handler on every replica. The admission check denies every new request, so an open MCP client session cannot be used again, and a streaming response runs until it ends.
 
@@ -424,7 +424,7 @@ There will be documentation guiding admins on how to enable SCIM:
 ## Testing and validation
 
 - **Unit tests:** filter parsing and escaping, PATCH semantics, SCIM errors and discovery, adapter lookup by provider name and adapter rules, token verification and rotation, admission subjects, the lifecycle state each user authenticator reports, and the group reference finder for every reference kind.
-- **Gateway tests on SQLite and PostgreSQL:** the lifecycle migration of existing databases, disable and reactivate, binding, concurrent creates and membership updates, retries after lost responses, and seat-limit contention.
+- **Gateway tests on SQLite and PostgreSQL:** the lifecycle migration of existing databases, disable and reactivate, outbox delivery of a disable event that is repeated or arrives after reactivation, binding, concurrent creates and membership updates, retries after lost responses, and seat-limit contention.
 - **Replay tests:** the requests recorded from Okta's two integration types, with IDs remapped, replayed against a database seeded like the discovery inventory. They reproduce the observed outcomes:
   - users bound by native ID;
   - groups bound by name, with stale members dropped;
