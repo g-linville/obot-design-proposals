@@ -33,7 +33,7 @@ a downstream application.
 
 - Okta provisions users, account status, groups, and group memberships to Obot through SCIM 2.0. Each change applies in Obot when Okta sends it.
 - Existing Okta users and groups keep their IDs. Roles, memberships, owned resources, and every policy subject string are unchanged.
-- Deactivating a user in Okta denies them access on every credential path, closes their open sessions, and deletes nothing. Reactivating them restores the same account and data.
+- Deactivating a user in Okta denies them access on every credential path, ends their browser sessions, and deletes nothing. Reactivating them restores the same account and data.
 - No user is dropped. Users that Okta never provisions keep their accounts but cannot sign in once SCIM is enforced. Provisioning them later re-enables them.
 - SCIM configuration is a clear two step process: Enable it to begin provisioning, and Enforce it to prevent unprovisioned users from accessing Obot. The Owner configuring SCIM can clearly see what will happen before enablement and enforcement.
 - Once SCIM is enabled, the Okta provider serves sign-in without Management API credentials.
@@ -110,7 +110,7 @@ flowchart LR
         Auth["Sign-in and credentials"] --> Check["Admission check"]
         Endpoint["SCIM endpoint"]
         DB[("Gateway database: users, identities, groups, memberships, SCIM bindings, lifecycle outbox")]
-        Ctrl["Controllers: close sessions, revoke refresh tokens, reconcile roles and group access"]
+        Ctrl["Controllers: revoke refresh tokens, reconcile roles and group access"]
     end
     OIDC -- "sign-in" --> Auth
     App -- "SCIM 2.0 with bearer token" --> Endpoint
@@ -123,8 +123,8 @@ The design adds:
 
 - a SCIM endpoint at `/scim/v2/<connection-id>`, with its own bearer-token authentication;
 - SCIM tables in the gateway database that bind SCIM resources to existing users and groups;
-- lifecycle fields on `User`, an admission check that enforces them on every credential path, and a lifecycle outbox that closes sessions and reconciles access after each change commits;
-- an adapter registry for provider-specific rules, with an `okta` adapter;
+- lifecycle fields on `User`, an admission check that enforces them on every credential path, and a lifecycle outbox that revokes refresh tokens and reconciles access after each change commits;
+- an adapter registry in Obot that holds every provider-specific SCIM rule, keyed by auth provider name, with an `okta` adapter;
 - a setup service and an admin page for Enable and Enforce;
 - mode checks that stop login-time directory synchronization for a SCIM-managed provider.
 
@@ -166,24 +166,15 @@ Constraints:
 - At most one connection exists, and an auth provider has at most one.
 - The existing unique `users.hashed_username` is unchanged.
 
-### Provider capability and adapters
+### Provider adapters
 
-An auth provider declares SCIM support in its manifest. The Okta provider's manifest adds:
+Obot keeps every provider-specific SCIM rule in an adapter registry in the server. The registry is keyed by auth provider name, and contains one adapter, `okta`, for `okta-auth-provider`. A provider supports SCIM only if the registry has an adapter for its name. Auth provider manifests declare nothing about SCIM, and the Okta provider's manifest does not change. The group ID prefix still comes from the manifest's existing `groupIDPrefix` field, which is not specific to SCIM.
 
-```yaml
-groupIDPrefix: "okta/"
-scim:
-  adapter: "okta"
-  # The API Services credentials serve only login-time directory synchronization, which SCIM replaces.
-  directoryConfigurationParameters:
-    - "OBOT_OKTA_AUTH_PROVIDER_SERVICE_CLIENT_ID"
-    - "OBOT_OKTA_AUTH_PROVIDER_SERVICE_PRIVATE_KEY"
-```
-
-Obot resolves `adapter` against a registry in the server, which contains only `okta`. The connection persists its adapter type, and every provider-specific decision goes through that adapter. Shared code never infers provider behavior from names, prefixes, or ID shapes.
+The connection persists its adapter type when it is created, and every provider-specific decision goes through that adapter. Apart from the registry lookup, shared code never infers provider behavior from names, prefixes, or ID shapes.
 
 | Adapter rule | Okta |
 | --- | --- |
+| Configuration parameters that serve only login-time directory synchronization, which SCIM replaces | The API Services credentials, `OBOT_OKTA_AUTH_PROVIDER_SERVICE_CLIENT_ID` and `OBOT_OKTA_AUTH_PROVIDER_SERVICE_PRIVATE_KEY`, with the descriptions the configuration form shows for them |
 | Configuration parameter that holds the issuer | `OBOT_OKTA_AUTH_PROVIDER_ISSUER_URL` |
 | Native ID of a SCIM user | `externalId`, which is required: at most 64 printable characters, with no whitespace |
 | Username and identity fields of a user that SCIM creates | The native ID as the Obot username, provider username, provider user ID, and group lookup ID, as Okta sign-in records them today |
@@ -193,9 +184,15 @@ Obot resolves `adapter` against a registry in the server, which contains only `o
 
 ### SCIM endpoint
 
-The base URL is `<obot-url>/scim/v2/<connection-id>`. A dedicated handler serves it outside the API server's authentication, authorization, rate limiting, and audit logging. Cookie authentication, redirects, and just-in-time user creation never run on it.
+The base URL is `<obot-url>/scim/v2/<connection-id>`. The API server serves it, through the same authentication, authorization, rate limiting, and audit logging as every other route:
 
-**Authentication:**
+- **Authentication.** A SCIM token authenticator joins the existing authenticator chain. It verifies the bearer token against the connection named in the URL, and yields a connection principal, which is not a user. On SCIM routes it is the only authenticator that runs. A missing or invalid token yields the anonymous principal, so cookie authentication, other credentials, redirects, and just-in-time user creation never run on these routes. When no connection exists, the authenticator fails the request with `503`, the way the server already maps other authentication errors to specific responses. The admission check skips the connection principal, as it skips other infrastructure principals.
+- **Authorization.** Like tunnel credentials, the connection principal is checked before any other rule. It may reach only its own connection's SCIM routes, and no other principal, including Owners, may reach them.
+- **Rate limiting.** The rate limiter counts the connection principal's requests by connection, and anonymous requests by source IP, as it does today. It sends `Retry-After` as an integer number of seconds, which Okta requires. Today it sends an HTTP date.
+- **Audit logging.** The audit log, which today covers only `/api/` routes, also covers SCIM routes. Its entries record the principal, method, path, and status, and never the query string or body.
+- **Errors.** On SCIM routes, the server writes authentication, rate-limit, and authorization failures as SCIM errors instead of plain text.
+
+**Tokens:**
 
 - The token is `obot_scim_` followed by 32 random bytes, base64url-encoded. It is independent of Okta OIDC credentials and Obot API keys, and it is shown once, when it is issued. Obot stores only its SHA-256 verifier, and compares verifiers in constant time.
 - Rotation issues a new token. The previous token is accepted for 24 hours, until an Owner revokes it, or until the next rotation, whichever comes first.
@@ -245,10 +242,10 @@ No new credential is issued for a disabled user. API key creation refuses them, 
 **Disabling a user.** One transaction sets the lifecycle columns, deletes the user's gateway auth tokens, which ends their browser sessions, and writes an outbox event. After it commits:
 
 - The event is delivered to the controller store as a `UserLifecycleChange` named after the event, so delivering it again changes nothing.
-- Every replica closes the user's in-flight requests, such as streaming responses, and their MCP client sessions. MCP deployments, including shared ones, keep running.
-- The leader deletes the user's MCP OAuth refresh tokens.
-- Every replica also rechecks its open sessions every 30 seconds, in case it missed an event.
+- The leader deletes the user's MCP OAuth refresh tokens. MCP deployments, including shared ones, keep running.
 - Handlers act on the user's current state, so a late event for a user who was already reactivated does nothing. They never delete data, memberships, or resources.
+
+Requests already in flight, such as streaming responses, are not closed, and neither are the user's MCP client sessions. Both are held in the memory of the replica serving them, so closing them would need a handler on every replica. The admission check denies every new request, so an open MCP client session cannot be used again, and a streaming response runs until it ends.
 
 Ended sessions and deleted refresh tokens are not restored on reactivation. API keys are kept, and they work again once the user is reactivated.
 
@@ -280,7 +277,7 @@ For a SCIM-managed provider, SCIM is the only source of groups, and a group that
 - a SCIM connection already exists;
 - no auth provider is configured;
 - an auth provider switch is staged, a provider configuration change is in progress, or data of a deconfigured provider that shares the group ID prefix is still being cleaned up;
-- the configured provider declares no SCIM capability, declares an adapter that this version of Obot does not support, or declares no group ID prefix;
+- the registry has no adapter for the configured provider's name, or the provider's manifest has no group ID prefix;
 - two referenced, unbound groups of the provider share a normalized name.
 
 For a duplicate display name (which is uncommon in Okta but technically possible), the preview lists each group with its ID, its Okta console link, and what references it. The admin resolves it in one of two ways:
@@ -330,13 +327,14 @@ The Okta provider can still be deconfigured, for example by switching to another
 - The connection, bindings, groups, memberships, role assignments, and policy subjects remain. Auth-provider cleanup skips a provider with a SCIM connection, and any provider that shares the connection's group ID prefix. Deleting a SCIM-managed provider's group data is refused under the mode lock, so a connection created during cleanup keeps its data.
 - While the provider is deconfigured, SCIM requests get `503`, and Okta records them as failed tasks, which it does not retry on its own. Nobody can sign in with the provider, and its users' lifecycle state is unchanged.
 - When the same provider is configured again, SCIM resumes in its recorded state. The admin then retries the failed changes in Okta: **Retry Selected** under **Dashboard > Tasks > Application accounts need deprovisioning** for deactivations, and **Retry All Groups** on the app's **Push Groups** tab for group changes. Marking a deprovisioning task complete instead would drop the deactivation.
+- The provider can be configured again with a different Org URL. The configuration form warns that SCIM bindings belong to the Okta organization they were created in, but does not refuse the change. An organization's Okta URL can change, for example with a move to a custom domain, while its users and groups stay the same. Obot cannot tell that apart from a move to another organization without asking Okta, and refusing a legitimate change would strand SCIM.
 
 Admins see each provider's SCIM state in the auth provider list. The switch confirmation says that SCIM pauses for the outgoing provider, or resumes for the incoming one, and that failed Okta tasks must be retried, not marked complete.
 
 ### Okta provider changes
 
-- The manifest adds the `scim` block above. The API Services parameter descriptions say that they are not required once SCIM is enabled.
-- Once a provider has a SCIM connection, Obot leaves its `directoryConfigurationParameters` out when deciding whether it is fully configured.
+- The manifest does not change. It still lists the API Services parameters as required.
+- Once a provider has a SCIM connection, Obot leaves the adapter's directory synchronization parameters out when deciding whether the provider is fully configured, and the configuration form shows the adapter's description of them, which says they are no longer needed.
 - Startup builds the Management API client only when both API Services values are set, and fails if only one is. Without them, the directory endpoints (`/obot-list-auth-groups`, `/obot-get-auth-groups`, `/obot-list-user-auth-groups`, and `/obot-get-group-migration-mapping`) answer `503`. Obot never calls them for a SCIM-managed provider.
 
 ### Admin API and UI
@@ -362,7 +360,7 @@ Only authenticated requests are recorded as activity, so someone who knows the b
 3. Binding evidence is scoped to the provider. A user binds only through an identity of the connection's exact auth provider, by native user ID, never by email. A group binds only to an unbound group of that provider.
 4. After Enable, only SCIM writes the provider's memberships, and the profiles and lifecycle state of its bound users. The one exception is a directory response already in flight at Enable, which lands before any group can be bound.
 5. Every SCIM mutation commits before the response. Repeated requests converge without new IDs, duplicate rows, or duplicate events.
-6. Shared SCIM code never infers provider behavior from names, prefixes, or ID shapes. The persisted adapter type selects provider-specific rules.
+6. Shared SCIM code never infers provider behavior from names, prefixes, or ID shapes. The adapter registry maps an auth provider name to an adapter when a connection is created, and the persisted adapter type selects provider-specific rules from then on.
 7. A failed lifecycle or mode lookup denies access or fails the operation. It never falls back to less restrictive behavior.
 
 ## Alternatives considered
@@ -386,6 +384,8 @@ After Enable, memberships and the IDs of SCIM-created groups exist only in SCIM,
   - This is acceptable because the admin has clear visibility into which groups need to be pushed prior to enforcement and what their Okta IDs are.
 - **SCIM writes are serialized.** One lock covers every SCIM write, which keeps binding and uniqueness simple, at a cost in write throughput.
   - Since there is only one SCIM client talking to Obot (the Okta organization), this is acceptable.
+- **Disabling a user does not cut off requests already in flight.** A streaming response that was open when the user was disabled runs until it ends.
+  - Closing it would need a lifecycle handler on every replica, and the admission check already denies every new request.
 - **The admission check trusts each authenticator's read.** Denial takes effect on the next request without an added database query, because every user credential path already reads the user's row. The check cannot confirm that a path reported the state from a fresh read.
   - A path that reports nothing is denied, so an omission locks users out instead of admitting them. A test for each authenticator checks what it reports.
 
@@ -396,17 +396,17 @@ After Enable, memberships and the IDs of SCIM-created groups exist only in SCIM,
 - **Suspension is not deprovisioning.** Suspending a user in Okta sends nothing. Their existing Obot credentials, such as API keys, keep working until their assignment is removed. The docs will instruct admins to remove the suspended user's SCIM assignment to Obot.
 - **Changes are missed while the provider is deconfigured.** Okta deactivations cannot reach Obot, and Okta does not retry them on its own. A deactivated user's API keys keep working until an admin retries the failed tasks. If the admin marks a deprovisioning task complete instead, Obot never receives the deactivation. This matches today's behavior for any deconfigured provider.
 - **Stale group names need a manual fix.** The admin must follow the rename sequence for each affected group.
+- **The provider can be pointed at another Okta organization.** Obot allows a changed Org URL, so if an admin configures the provider for a different organization, SCIM resumes with the old organization's bindings, and the old organization's SCIM app keeps its token. The configuration form's warning and the documentation cover this.
 
 ### Open questions
 
-- **Should Obot refuse to reconfigure Okta with a different org?** SCIM would resume with the old org's bindings, and the old org's app would keep its token. Comparing the issuer with the one recorded on the connection would prevent this, but it would also refuse moving the same org to a custom domain.
-- **Should SCIM requests be audit-logged or rate limited?** The endpoint bypasses the API server's audit log and rate limiter. It records a log line per request and the recent failures.
+None.
 
 ## Rollout and migration
 
-**Upgrade.** Gateway auto-migration adds the new tables and the lifecycle columns. A one-time migration marks every existing user as enabled, without touching IDs, profiles, roles, or deletion state. Nothing else changes until an Owner enables SCIM. There is no feature flag. Admins see the SCIM tab, and Enable is blocked unless the configured provider declares a supported adapter.
+**Upgrade.** Gateway auto-migration adds the new tables and the lifecycle columns. A one-time migration marks every existing user as enabled, without touching IDs, profiles, roles, or deletion state. Nothing else changes until an Owner enables SCIM. There is no feature flag. Admins see the SCIM tab, and Enable is blocked unless the registry has an adapter for the configured provider.
 
-**Okta provider release.** The Okta provider must be released with the `scim` manifest block and optional API Services credentials. If Obot runs with an older Okta provider, Enable is blocked because the provider does not support SCIM.
+**Okta provider release.** The Okta provider must be released with optional API Services credentials, no later than the Obot release that uses it. Obot recognizes the provider by name, not by anything the provider declares, so it cannot tell whether the installed provider binary can start without the credentials. The Obot image bundles the enterprise providers when it is built, so each release includes a compatible binary. An installation that overrides the provider registry must update the Okta provider before removing the credentials.
 
 There will be documentation guiding admins on how to enable SCIM:
 
@@ -423,7 +423,7 @@ There will be documentation guiding admins on how to enable SCIM:
 
 ## Testing and validation
 
-- **Unit tests:** filter parsing and escaping, PATCH semantics, SCIM errors and discovery, adapter rules, token verification and rotation, admission subjects, the lifecycle state each user authenticator reports, and the group reference finder for every reference kind.
+- **Unit tests:** filter parsing and escaping, PATCH semantics, SCIM errors and discovery, adapter lookup by provider name and adapter rules, token verification and rotation, admission subjects, the lifecycle state each user authenticator reports, and the group reference finder for every reference kind.
 - **Gateway tests on SQLite and PostgreSQL:** the lifecycle migration of existing databases, disable and reactivate, binding, concurrent creates and membership updates, retries after lost responses, and seat-limit contention.
 - **Replay tests:** the requests recorded from Okta's two integration types, with IDs remapped, replayed against a database seeded like the discovery inventory. They reproduce the observed outcomes:
   - users bound by native ID;
@@ -433,7 +433,8 @@ There will be documentation guiding admins on how to enable SCIM:
   - repeated `PUT`s with no effect.
 - **Credential paths:** old browser cookies, gateway tokens, API keys and the API key webhook, persistent and MCP tokens including refresh, device and tunnel flows, hosted-agent owners, and impersonation all deny disabled users. A user principal with no recorded state is denied, and a failed user read never falls through to anonymous access.
 - **Enable and Enforce:** the duplicate-name block and its message, which groups are deleted and when, no resource cleanup, the warnings, both Enforce blockers, exactly the unprovisioned users disabled, no membership changes, and permanence across restarts.
-- **Deconfiguration:** `503` before authentication with no connection, and after authentication while the provider is deconfigured; bindings, groups, and policy subjects survive; retried tasks bring Obot up to date.
+- **SCIM routes and the API server:** only the connection principal reaches its own connection's SCIM routes; Owners, other credentials, and anonymous callers are refused there, and the connection principal is refused everywhere else. Authentication, rate-limit, and authorization failures are SCIM errors, `429` carries an integer `Retry-After`, and audit entries contain no token, query string, or body.
+- **Deconfiguration:** `503` from the SCIM authenticator with no connection, and after authentication while the provider is deconfigured; bindings, groups, and policy subjects survive; retried tasks bring Obot up to date; a changed Org URL is accepted with a warning.
 - **UI tests:** the SCIM tab, both review screens, Owner-only actions, user status, and read-only fields for SCIM-managed users.
 
 ## References
