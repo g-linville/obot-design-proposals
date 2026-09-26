@@ -66,7 +66,7 @@ a downstream application.
 | Group sync | [`ensureGroups`](https://github.com/obot-platform/obot/blob/main/pkg/gateway/client/group.go) refreshes memberships from Okta on browser requests, at most every ten minutes. `ListAuthGroups` and `ResolveAuthGroups` ask Okta when admins browse groups or resolve IDs. The local group table is partial: it knows only groups whose members signed in, and its names can be stale. | All three stop for a SCIM-managed provider. |
 | Deletion | [`DeleteUser`](https://github.com/obot-platform/obot/blob/main/pkg/gateway/client/user.go) soft-deletes the user, rewrites their email and username, removes their memberships, and schedules [resource cleanup](https://github.com/obot-platform/obot/blob/main/pkg/controller/handlers/cleanup/user.go). | Deactivation is a new operation that never calls it. Users may be deleted after they have been deactivated. |
 | Credentials | [`UserDecorator`](https://github.com/obot-platform/obot/blob/main/pkg/gateway/client/auth.go) does not wrap every authenticator. [API keys](https://github.com/obot-platform/obot/blob/main/pkg/gateway/server/apikey_auth.go), [persistent tokens](https://github.com/obot-platform/obot/blob/main/pkg/jwt/persistent/persistent.go), MCP OAuth tokens, device and tunnel flows, and hosted-agent keys authenticate on separate paths. Every path that authenticates a user already reads the user's row from the gateway database on each request. Hosted-agent keys are the exception: they take their owner's ID from the controller store. When the user read fails, persistent and MCP OAuth tokens still authenticate, with the groups in the token, and the API key authenticator declines the key, so the request continues to anonymous access. | A deactivated user must be denied on all of them. The admission check can use the existing reads, but a failed read must deny access. |
-| Membership events | Membership changes emit events. [MCP group-loss cleanup](https://github.com/obot-platform/obot/blob/main/pkg/controller/handlers/mcpcatalog/usergroupchange.go) and [workspace reconciliation](https://github.com/obot-platform/obot/blob/main/pkg/controller/handlers/poweruserworkspace/poweruserworkspace.go) act on them and can delete resources. | Deactivation must not remove memberships. |.
+| Membership events | Membership changes emit events. [MCP group-loss cleanup](https://github.com/obot-platform/obot/blob/main/pkg/controller/handlers/mcpcatalog/usergroupchange.go) and [workspace reconciliation](https://github.com/obot-platform/obot/blob/main/pkg/controller/handlers/poweruserworkspace/poweruserworkspace.go) act on them and can delete resources. | Deactivation must not remove memberships. |
 | Provider cleanup | [Auth-provider cleanup](https://github.com/obot-platform/obot/blob/main/pkg/controller/handlers/cleanup/authprovider.go), added for [#7632](https://github.com/obot-platform/obot/issues/7632), strips a deconfigured provider's group subjects from six policy types and deletes its group data. | For a SCIM-managed provider, that would destroy the group IDs Okta holds. SCIM-related data is retained even after auth provider deconfiguration. |
 | Okta provider | Its [manifest](https://github.com/obot-platform/enterprise-providers/blob/main/auth-providers/okta-auth-provider.yaml) requires API Services credentials, and its [startup](https://github.com/obot-platform/enterprise-providers/blob/main/okta-auth-provider/main.go) always builds a Management API client. | The credentials are not necessary when SCIM is enabled. |
 | Transactions | The gateway database, SQLite or PostgreSQL, cannot share a transaction with the controller store. | Work that follows a gateway change must be delivered durably after commit. |
@@ -134,10 +134,11 @@ The design adds:
 stateDiagram-v2
     direction LR
     legacy --> connected: Enable
+    unconfigured --> connected: Configure without API Services credentials
     connected --> enforced: Enforce
 ```
 
-Both transitions are permanent.
+Enable and Enforce are permanent.
 
 | State | Users | Groups | Login-time synchronization |
 | --- | --- | --- | --- |
@@ -155,6 +156,7 @@ The existing tables remain the working data. The design adds lifecycle columns t
 | `scim_connections` | New table to represent a SCIM connection between an auth provider (Okta in this case) and Obot. Includes the hash of the bearer token generated for Okta. |
 | `scim_user_bindings` | A server-issued SCIM UUID; the connection; the Obot user ID; the hashed native user ID; the `externalId`, the SCIM `userName`, and the supported SCIM profile attributes that `User` cannot hold, all encrypted; the hashed, case-folded `userName`; the `active` value Okta last sent; a revision; and `retired_at`. |
 | `scim_group_bindings` | A server-issued SCIM UUID; the connection; the Obot group ID; the normalized display name; a revision; and `retired_at`. |
+| Pending group deletion marker | Marks the unreferenced groups that Enable or Enforce is about to delete, so the API refuses new references to them while the deletion completes. |
 | `scim_request_failures` | Recent failed authenticated requests of each connection: method, resource path, status, SCIM error type, and detail. The detail can echo request values, so it is encrypted. |
 | `user_lifecycle_events` | An outbox, written in the same transaction as a lifecycle or membership change and delivered to the controller store afterward. |
 
@@ -222,7 +224,7 @@ If, after SCIM is enabled but before it is enforced, a group known to Obot is re
 
 Okta alone controls a SCIM-managed user's access. Obot has no separate block for these users.
 
-**Admission check.** One check wraps the complete authenticator chain, so it runs once after authentication and before authorization, whichever credential authenticated the request. That covers browser sessions, gateway tokens, personal API keys, persistent and MCP OAuth tokens, device and tunnel flows, and impersonation. Hosted-agent keys are checked against the agent's owner.
+**Admission check.** One check wraps the complete authenticator chain, so it runs once after authentication and before authorization, whichever credential authenticated the request. That covers browser sessions, gateway tokens, personal API keys, persistent and MCP OAuth tokens, user-bound device and tunnel flows, and impersonation. Hosted-agent keys are checked against the agent's owner.
 
 The check adds no database query. Every authenticator that yields a user already reads that user's row from the gateway database on each request, so it reports the user's lifecycle state from that read, and the check enforces it:
 
@@ -297,10 +299,17 @@ Finally, the preview lists the unreferenced groups that Enable will delete, the 
 **Effects.** `POST /api/scim-connections`, for Owners only:
 
 1. Create the connection in the `connected` state, and return the token once. From this moment, login-time synchronization, group discovery, and name refresh stop for the provider. A directory call already in flight still writes its result. Directory calls time out after 30 seconds, and Okta cannot push a group until the admin sets up the SCIM app with this token, so the write lands before any group can be bound.
-2. Read the groups and references again, then delete the provider's unbound, unreferenced groups and their memberships. These groups grant nothing, so deleting them emits no events and triggers no resource cleanup. Synchronization has already stopped, so only a directory response that was in flight at Enable can recreate one. Such a group grants nothing, and Enforce deletes it.
-3. Scan again for references to the deleted groups, and restore any group that became referenced in between, with its members. References live in the controller store, so the scan and the deletion cannot share a transaction.
+2. Delete the provider's unbound, unreferenced groups and their memberships, in two phases. References live in the controller store, so the reference scan and the deletion cannot share a transaction.
+   1. Read the groups and references again, and mark the unreferenced groups as pending deletion. From then on, the API refuses new references to them.
+   2. Scan the references again, unmark any group that gained a reference in between, and delete the rest.
 
-The token cannot be retrieved again, so once the connection exists, Enable succeeds even if step 2 fails, and reports the failure. Enforce deletes those groups later.
+   These groups grant nothing, so deleting them emits no events and triggers no resource cleanup. Nothing is deleted until the second scan, so a group that gains a reference is unmarked, never deleted and rebuilt. Synchronization has already stopped, so only a directory response that was in flight at Enable can recreate a deleted group. Such a group grants nothing, and Enforce deletes it.
+
+The token cannot be retrieved again, so once the connection exists, Enable succeeds even if step 2 fails, and reports the failure. The marks persist, so the deletion can be retried from the SCIM tab, and Enforce deletes those groups otherwise.
+
+### SCIM-first setup
+
+A provider can also use SCIM from the start, with no migration. When an admin configures the Okta provider without the API Services credentials, Obot creates the connection in the `connected` state as part of that configuration change, before anyone signs in through the provider, so login-time synchronization never runs for it. There is nothing to Enable: the token is generated on the SCIM tab, Okta is set up, and Enforce is reviewed and run as on the migration path. Configuring the provider with the credentials still sets up login-time synchronization, which can move to SCIM later through Enable.
 
 ### Enforce
 
@@ -312,13 +321,13 @@ The token cannot be retrieved again, so once the connection exists, Enable succe
 
 After Enable, nothing corrects an unpushed group's memberships. If Enforce kept them, a user removed in Okta would keep access indefinitely. If it emptied them, access would be cut silently. Blocking makes the admin decide, so Enforce never changes group-based access on its own.
 
-**Effects.** `POST /api/scim-connections/{id}/enforce`, for Owners only, checks the blockers again and applies these changes in one gateway transaction. The transaction holds the mode lock exclusively, so each sign-in either finishes first or sees the enforcement. It also holds the SCIM write lock, so no user is provisioned between being found unprovisioned and being disabled.
+**Effects.** `POST /api/scim-connections/{id}/enforce`, for Owners only, deletes unreferenced groups with the same two-phase deletion as Enable. It first marks the provider's unbound, unreferenced groups as pending deletion, commits the marks so the API refuses new references to them, and scans the references again. It then checks the blockers again, which catches a group that gained a reference in the meantime, and applies these changes in one gateway transaction. The transaction holds the mode lock exclusively, so each sign-in either finishes first or sees the enforcement. It also holds the SCIM write lock, so no user is provisioned between being found unprovisioned and being disabled.
 
 - Disable every live user of the provider who has no unretired binding, with reason `scim_unprovisioned`. Nothing is deleted.
-- Delete the provider's unbound groups that nothing references any longer, as Enable does.
+- Delete the groups that are still pending deletion.
 - Record the enforcement. From then on, sign-in with the provider requires a live, bound user, and never creates a user.
 
-After the transaction commits, Enforce restores any deleted group that became referenced in between, as Enable does. Enforce changes no memberships of the groups it keeps, and never affects users of local auth or other providers. If Okta later provisions a user who was disabled at Enforce, `POST /Users` binds and re-enables them.
+Enforce changes no memberships of the groups it keeps, and never affects users of local auth or other providers. If Okta later provisions a user who was disabled at Enforce, `POST /Users` binds and re-enables them.
 
 ### Provider deconfiguration
 
@@ -349,7 +358,7 @@ Admins see each provider's SCIM state in the auth provider list. The switch conf
 | `POST /api/scim-connections/{id}/rotate-token` | Owners | Issue a new token. Returns it once. |
 | `POST /api/scim-connections/{id}/revoke-previous-token` | Owners | Stop accepting the previous token |
 
-The Identity & Access page gains a **SCIM** tab. Before a connection exists, it shows the Enable preview. Afterward, it shows the state, the base URL, token rotation, the users Okta has and has not provisioned, bound groups, referenced groups not pushed yet, the groups Enforce would delete, warnings, Enforce blockers, and activity: the last request, the last successful request, and the 20 most recent failures. The **Users** tab shows each user's status, disable reason, and whether SCIM manages them.
+The Identity & Access page gains a **SCIM** tab. Before a connection exists, it shows the Enable preview. Afterward, it shows the state, the base URL, token rotation, the users Okta has and has not provisioned, bound groups, referenced groups not pushed yet, the groups Enforce would delete, warnings, Enforce blockers, and activity: the last request, the last successful request, and recent failures. Its lists, like those of the Enforce review, are paginated. The **Users** tab shows each user's status, disable reason, and whether SCIM manages them.
 
 Only authenticated requests are recorded as activity, so someone who knows the base URL cannot fill the failure log. Activity shows that Okta is sending requests. It does not show that Okta and Obot agree.
 
@@ -358,7 +367,7 @@ Only authenticated requests are recorded as activity, so someone who knows the b
 1. SCIM requests never delete a user, change a user ID, remove an identity, or free a username.
 2. Existing group IDs never change. A rename changes only the display name.
 3. Binding evidence is scoped to the provider. A user binds only through an identity of the connection's exact auth provider, by native user ID, never by email. A group binds only to an unbound group of that provider.
-4. After Enable, only SCIM writes the provider's memberships, and the profiles and lifecycle state of its bound users. The one exception is a directory response already in flight at Enable, which lands before any group can be bound.
+4. While a connection exists, only SCIM writes the provider's memberships, and the profiles and lifecycle state of its bound users. The one exception is a directory response already in flight at Enable, which lands before any group can be bound.
 5. Every SCIM mutation commits before the response. Repeated requests converge without new IDs, duplicate rows, or duplicate events.
 6. Shared SCIM code never infers provider behavior from names, prefixes, or ID shapes. The adapter registry maps an auth provider name to an adapter when a connection is created, and the persisted adapter type selects provider-specific rules from then on.
 7. A failed lifecycle or mode lookup denies access or fails the operation. It never falls back to less restrictive behavior.
@@ -432,7 +441,7 @@ There will be documentation guiding admins on how to enable SCIM:
   - deactivation and reactivation over `PUT` and `PATCH`;
   - repeated `PUT`s with no effect.
 - **Credential paths:** old browser cookies, gateway tokens, API keys and the API key webhook, persistent and MCP tokens including refresh, device and tunnel flows, hosted-agent owners, and impersonation all deny disabled users. A user principal with no recorded state is denied, and a failed user read never falls through to anonymous access.
-- **Enable and Enforce:** the duplicate-name block and its message, which groups are deleted and when, no resource cleanup, the warnings, both Enforce blockers, exactly the unprovisioned users disabled, no membership changes, and permanence across restarts.
+- **Enable and Enforce:** the duplicate-name block and its message, which groups are deleted and when, no resource cleanup, the warnings, each Enforce blocker, exactly the unprovisioned users disabled, no membership changes, and permanence across restarts.
 - **SCIM routes and the API server:** only the connection principal reaches its own connection's SCIM routes; Owners, other credentials, and anonymous callers are refused there, and the connection principal is refused everywhere else. Authentication, rate-limit, and authorization failures are SCIM errors, `429` carries an integer `Retry-After`, and audit entries contain no token, query string, or body.
 - **Deconfiguration:** `503` from the SCIM authenticator with no connection, and after authentication while the provider is deconfigured; bindings, groups, and policy subjects survive; retried tasks bring Obot up to date; a changed Org URL is accepted with a warning.
 - **UI tests:** the SCIM tab, both review screens, Owner-only actions, user status, and read-only fields for SCIM-managed users.
